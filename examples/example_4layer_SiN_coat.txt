@@ -1,0 +1,8 @@
+# layer_id,material,thickness,is_source,is_probe
+# Example: 4-layer unit cell with SiN coating
+PERIODIC_BOUNDARY
+0,SiN,0.050000,True,False
+1,SiN,0.150000,True,False
+2,Vacuum,0.100000,False,True
+3,SiN,0.150000,True,False
+PERIODIC_BOUNDARY

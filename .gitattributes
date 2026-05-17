@@ -1,0 +1,14 @@
+# Auto-detect text files and normalize line endings
+* text=auto
+
+# Python files
+*.py text diff=python
+
+# Data files (no line ending conversion)
+materials/*.txt binary
+
+# Config / input files
+examples/*.txt text
+
+# Markdown
+*.md text

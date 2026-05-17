@@ -1,0 +1,6 @@
+# layer_id,material,thickness,is_source,is_probe
+# Example: 2-layer unit cell (SiN fin + Vacuum gap, no coating)
+PERIODIC_BOUNDARY
+0,SiN,0.150000,True,False
+1,Vacuum,0.100000,False,True
+PERIODIC_BOUNDARY
