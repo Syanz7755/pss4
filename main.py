@@ -232,9 +232,19 @@ def run_solver(input_path: str, args: dict):
     if has_groups:
         logger.info("Group mode enabled: will compute per-source-layer contributions for grouping")
     
+    # Extract gap thickness from probe layer (Vacuum layer)
+    gap_thickness = None
+    for layer in parsed_layers:
+        if layer['material'] == 'Vacuum':
+            gap_thickness = layer['thickness'] * 1e-6  # Convert um to m
+            logger.info(f"Detected vacuum gap thickness: {gap_thickness:.3e} m")
+            break
+    
     logger.info("Building k_parallel grid")
-    k_par_grid, k_weights = build_k_grid(omega_grid[0])
+    k_par_grid, k_weights = build_k_grid(omega_grid[0], gap_thickness)
     logger.info(f"k_parallel grid: {len(k_par_grid)} points, range [{k_par_grid[0]:.3e}, {k_par_grid[-1]:.3e}] 1/m")
+    if gap_thickness:
+        logger.info(f"k_max * gap = {k_par_grid[-1] * gap_thickness:.1f} (should be >> 1 for near-field)")
     
     for probe_idx in probe_indices:
         probe_layer = parsed_layers[probe_idx]
