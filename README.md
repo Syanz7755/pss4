@@ -86,6 +86,21 @@ python main.py examples/example_2layer.txt --temperature 300 --all-freq --out-di
 python main.py examples/example_4layer_coated.txt --temperature 300 --out-dir results/
 ```
 
+### Custom input and output directories
+
+The stack configuration file is provided as the positional `input_path` argument,
+and results can be written to any directory with `--out-dir`:
+
+```bash
+python main.py D:/project_inputs/coated_stack.txt \
+  --temperature 300 \
+  --out-dir D:/project_results/pss4/coated_stack
+```
+
+The output directory is created when needed. Use a separate output directory for
+each independent run or parallel shard. The default output directory is
+`results/`.
+
 ## Usage
 
 ### Command-line arguments
