@@ -4,6 +4,50 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple, Optional
 
+OMEGA_COLUMN = 'omega (rad/s)'
+SPECTRAL_COLUMN = 'spectral_flux (W/m2/K/(rad/s))'
+
+def _empty_result_like(df: pd.DataFrame, temperature: float = None) -> pd.DataFrame:
+    result = pd.DataFrame({
+        OMEGA_COLUMN: df[OMEGA_COLUMN].values,
+        'transmission': np.zeros(len(df)),
+    })
+    if temperature is not None:
+        result[SPECTRAL_COLUMN] = np.zeros(len(df))
+    return result
+
+def _add_result_frame(accum: Optional[pd.DataFrame], df: pd.DataFrame,
+                      temperature: float = None) -> pd.DataFrame:
+    if accum is None:
+        accum = _empty_result_like(df, temperature)
+    merged = pd.merge(accum, df, on=OMEGA_COLUMN, how='outer',
+                      suffixes=('_accum', '_new'))
+    merged['transmission'] = (
+        merged['transmission_accum'].fillna(0.0)
+        + merged['transmission_new'].fillna(0.0)
+    )
+    keep_cols = [OMEGA_COLUMN, 'transmission']
+    if temperature is not None:
+        accum_col = f'{SPECTRAL_COLUMN}_accum'
+        new_col = f'{SPECTRAL_COLUMN}_new'
+        accum_values = merged[accum_col] if accum_col in merged.columns else 0.0
+        new_values = merged[new_col] if new_col in merged.columns else 0.0
+        if hasattr(accum_values, 'fillna'):
+            accum_values = accum_values.fillna(0.0)
+        if hasattr(new_values, 'fillna'):
+            new_values = new_values.fillna(0.0)
+        merged[SPECTRAL_COLUMN] = accum_values + new_values
+        keep_cols.append(SPECTRAL_COLUMN)
+    return merged[keep_cols].sort_values(OMEGA_COLUMN).reset_index(drop=True)
+
+def _frame_to_result_dict(df: pd.DataFrame) -> Dict:
+    return {col: df[col].values for col in df.columns}
+
+def _integrate_trapezoid(y: np.ndarray, x: np.ndarray) -> float:
+    if hasattr(np, 'trapezoid'):
+        return np.trapezoid(y, x)
+    return np.trapz(y, x)
+
 def aggregate_probe_results(out_dir: str, tasks: List[Tuple[str, list]], 
                            omega_grid: np.ndarray, temperature: float = None,
                            group_defs: Optional[List[Dict]] = None):
@@ -16,7 +60,7 @@ def aggregate_probe_results(out_dir: str, tasks: List[Tuple[str, list]],
         temperature: Temperature if specified
         group_defs: Optional list of group definitions with 'name' and 'ids' keys
     """
-    probe_results = {}
+    probe_frames = {}
     
     if group_defs is not None:
         return _aggregate_by_groups(out_dir, tasks, omega_grid, temperature, group_defs)
@@ -24,25 +68,16 @@ def aggregate_probe_results(out_dir: str, tasks: List[Tuple[str, list]],
     for task_id, task_layers in tasks:
         probe_id = task_id
         
-        if probe_id not in probe_results:
-            probe_results[probe_id] = {
-                'omega (rad/s)': omega_grid,
-                'transmission': np.zeros(len(omega_grid))
-            }
-            if temperature is not None:
-                probe_results[probe_id]['spectral_flux (W/m2/K/(rad/s))'] = np.zeros(len(omega_grid))
-        
         task_file = os.path.join(out_dir, f"{task_id}.csv")
         if os.path.exists(task_file):
             df = pd.read_csv(task_file)
-            probe_results[probe_id]['transmission'] += df['transmission'].values
-            if temperature is not None:
-                probe_results[probe_id]['spectral_flux (W/m2/K/(rad/s))'] += df['spectral_flux (W/m2/K/(rad/s))'].values
+            probe_frames[probe_id] = _add_result_frame(probe_frames.get(probe_id), df, temperature)
     
-    for probe_id, results in probe_results.items():
-        df = pd.DataFrame(results)
+    probe_results = {}
+    for probe_id, df in probe_frames.items():
         output_file = os.path.join(out_dir, f"tot_{probe_id}.csv")
         df.to_csv(output_file, index=False, float_format='%.15e')
+        probe_results[probe_id] = _frame_to_result_dict(df)
         print(f"Saved aggregated results to {output_file}")
     
     return probe_results
@@ -55,7 +90,7 @@ def _aggregate_by_groups(out_dir: str, tasks: List[Tuple[str, list]],
     For each probe P{x}, reads P{x}_S{y}.csv files for each source layer y,
     sums according to group defs, and outputs sum_{group_name}_P{x}.csv.
     """
-    grouped_results = {}
+    grouped_frames = {}
     
     for task_id, _ in tasks:
         probe_id = task_id  
@@ -64,29 +99,21 @@ def _aggregate_by_groups(out_dir: str, tasks: List[Tuple[str, list]],
             source_ids = group['ids']
             sum_key = f"sum_{group_name}_{probe_id}"
             
-            grouped_results[sum_key] = {
-                'omega (rad/s)': omega_grid,
-                'transmission': np.zeros(len(omega_grid))
-            }
-            if temperature is not None:
-                grouped_results[sum_key]['spectral_flux (W/m2/K/(rad/s))'] = np.zeros(len(omega_grid))
-            
             for src_id in source_ids:
                 src_task_id = f"{probe_id}_S{src_id}"
                 src_file = os.path.join(out_dir, f"{src_task_id}.csv")
                 if os.path.exists(src_file):
                     df = pd.read_csv(src_file)
-                    grouped_results[sum_key]['transmission'] += df['transmission'].values
-                    if temperature is not None:
-                        grouped_results[sum_key]['spectral_flux (W/m2/K/(rad/s))'] += df['spectral_flux (W/m2/K/(rad/s))'].values
+                    grouped_frames[sum_key] = _add_result_frame(grouped_frames.get(sum_key), df, temperature)
                     print(f"  Added source S{src_id} contribution to {sum_key}")
                 else:
                     print(f"  WARNING: Source file {src_file} not found")
     
-    for sum_key, results in grouped_results.items():
-        df = pd.DataFrame(results)
+    grouped_results = {}
+    for sum_key, df in grouped_frames.items():
         output_file = os.path.join(out_dir, f"{sum_key}.csv")
         df.to_csv(output_file, index=False, float_format='%.15e')
+        grouped_results[sum_key] = _frame_to_result_dict(df)
         print(f"Saved grouped result to {output_file}")
     
     tot_probe_results = {}
@@ -95,13 +122,8 @@ def _aggregate_by_groups(out_dir: str, tasks: List[Tuple[str, list]],
         tot_file = os.path.join(out_dir, f"{probe_id}.csv")
         if os.path.exists(tot_file):
             df = pd.read_csv(tot_file)
-            tot_probe_results[probe_id] = {
-                'omega (rad/s)': omega_grid,
-                'transmission': df['transmission'].values
-            }
-            if temperature is not None and 'spectral_flux (W/m2/K/(rad/s))' in df.columns:
-                tot_probe_results[probe_id]['spectral_flux (W/m2/K/(rad/s))'] = df['spectral_flux (W/m2/K/(rad/s))'].values
-            
+            df = df.sort_values(OMEGA_COLUMN).reset_index(drop=True)
+            tot_probe_results[probe_id] = _frame_to_result_dict(df)
             output_file = os.path.join(out_dir, f"tot_{probe_id}.csv")
             df.to_csv(output_file, index=False, float_format='%.15e')
             print(f"Saved total probe result to {output_file}")
@@ -190,7 +212,7 @@ def generate_final_report(out_dir: str, probe_results: Dict, args: dict,
             
             if 'spectral_flux (W/m2/K/(rad/s))' in results:
                 spectral_flux = results['spectral_flux (W/m2/K/(rad/s))']
-                integrated_flux = np.trapz(spectral_flux, omega)
+                integrated_flux = _integrate_trapezoid(spectral_flux, omega)
                 f.write(f"\n  Integrated heat transfer coefficient: {integrated_flux:.15e} W/m²/K\n")
             
             f.write("\n")

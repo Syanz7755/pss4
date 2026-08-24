@@ -4,6 +4,19 @@
 
 pss4 computes near-field radiative heat transfer coefficients (RHTC) for 1D periodic planar structures using the S-matrix (Redheffer Star Product) method. It supports multi-layer unit cells with arbitrary material stacking under periodic boundary conditions.
 
+## Recommended Solver Tree
+
+Use `pss4_project/` for new PSS4 calculations. The sibling workspace directory
+`pss4/` is deprecated and should be treated as a legacy/experimental copy for
+historical scripts and diagnostics only.
+
+`pss4_project` is deliberately scoped to the local 1D periodic-stack FED
+problem. It computes the local sidewall coefficient `h_W`; device-scale
+quantities such as fin height `H`, aspect ratio, overlap length, and
+footprint-normalized `h_eff` belong in the downstream geometry/thermal model.
+Use `--meta KEY=VALUE` to record those external values in `run_metadata.json`
+without coupling them into the optical stack solve.
+
 ## Features
 
 - S-matrix formalism with Redheffer star product for arbitrary multi-layer stacking
@@ -82,7 +95,25 @@ python main.py examples/example_4layer_coated.txt --temperature 300 --out-dir re
 | `input_path` | Path to stack configuration file (required) | — |
 | `--temperature` | Source temperature in Kelvin | None |
 | `--all-freq` | Use full frequency grid (2502 points) | False |
+| `--freq-skip N` | Use every `N`th frequency from the selected material table | `1` |
+| `--freq-offset N` | Starting offset for `--freq-skip` subsets | `0` |
+| `--freq-indices LIST_OR_FILE` | Explicit frequency indices as `0,5,10` or a text file | None |
+| `--freq-values-file PATH` | Explicit omega values in rad/s; values must exist in the material tables | None |
+| `--resume` | Skip omega rows already present in output CSVs and merge sorted unique outputs | False |
 | `--out-dir` | Output directory | `results/` |
+| `--meta KEY=VALUE` | Passive metadata tag written to `run_metadata.json`; may be repeated | None |
+
+### Tau heatmaps
+
+Generate a `tau_p(omega,k_parallel)` heatmap with the propagating/evanescent
+boundary drawn using the shared light-line helper:
+
+```bash
+python scripts/visualize_tau_heatmaps.py examples/example_2layer.txt --polarization p --out-dir results/
+```
+
+Use `--no-prop-evan-boundary` to omit the curve. Boundary style can be adjusted
+with `--boundary-color`, `--boundary-linestyle`, and `--boundary-linewidth`.
 
 ### Programmatic usage
 
@@ -93,20 +124,39 @@ args = {
     'temperature': 300.0,
     'all_freq': True,
     'freq_skip': 2,       # Optional: skip factor for frequency grid
-    'out_dir': 'results/'
+    'out_dir': 'results/',
+    'metadata': {'W_um': '0.6667', 'H_um': '20.001', 'aspect_ratio': '30'}
 }
 run_solver('examples/example_2layer.txt', args)
 ```
 
-### Frequency grid control
+### Frequency grid control and resumable refinement
 
-The `freq_skip` parameter (programmatic only) controls frequency grid density:
+The `freq_skip` parameter controls frequency grid density:
 
 | freq_skip | Points | Use case |
 |-----------|--------|----------|
 | 1 | 2502 | Full resolution |
 | 2 | 1251 | Standard |
 | 6 | 417 | Quick scan |
+
+For a rough-to-dense workflow, run a sparse subset first, then rerun the same
+input into the same output directory with a denser subset and `--resume`.
+Already-computed angular frequencies are skipped, and the output CSVs are
+merged by `omega (rad/s)`:
+
+```bash
+# rough pass: every 12th dense-grid frequency
+python main.py examples/example_2layer.txt --temperature 300 --all-freq --freq-skip 12 --out-dir results/case_a
+
+# refinement pass: every 3rd dense-grid frequency, reusing the same output dir
+python main.py examples/example_2layer.txt --temperature 300 --all-freq --freq-skip 3 --resume --out-dir results/case_a
+```
+
+Use `--freq-offset` to split one stride into independent parallel shards, for
+example `--freq-skip 4 --freq-offset 0`, `1`, `2`, and `3`. Use distinct output
+directories for parallel processes, or serialize `--resume` writes to the same
+directory.
 
 ## Input File Format
 
@@ -151,6 +201,8 @@ For each probe layer, the solver produces:
 - `tot_P{id}.csv` — Aggregated results
 - `tot_P{id}_plot.png` — Spectral flux plot (if temperature specified)
 - `final_report.txt` — Summary with integrated heat transfer coefficient
+- `run_metadata.json` - Solver grid/layer metadata plus passive external
+  metadata supplied with `--meta`.
 
 ## Method
 

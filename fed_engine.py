@@ -1,9 +1,22 @@
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 import logging
 from utils import hbar, k_B
+from utils import c
 
 logger = logging.getLogger("fed_solver")
+
+def compute_prop_evan_boundary(omega: float, eps_gap: complex = 1.0) -> float:
+    """Return the propagating/evanescent k_parallel boundary for a gap medium."""
+    return float(np.real((omega / c) * np.sqrt(eps_gap)))
+
+def classify_prop_evan_modes(k_par_grid: np.ndarray, omega: float,
+                             eps_gap: complex = 1.0) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Classify k_parallel samples as propagating or evanescent in the gap."""
+    k_boundary = compute_prop_evan_boundary(omega, eps_gap)
+    propagating_mask = k_par_grid < k_boundary
+    evanescent_mask = ~propagating_mask
+    return propagating_mask, evanescent_mask, k_boundary
 
 def compute_transmission(kz_gap: complex, d_gap: float, R_L: complex, R_R: complex) -> float:
     """Compute dimensionless energy transmission probability.

@@ -1,14 +1,21 @@
 import numpy as np
 import os
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional, Sequence
 
-def load_materials_and_grid(parsed_layers: List[Dict], all_freq: bool, freq_skip: int = 1) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+def load_materials_and_grid(parsed_layers: List[Dict], all_freq: bool, freq_skip: int = 1,
+                            freq_offset: int = 0,
+                            freq_indices: Optional[Sequence[int]] = None,
+                            freq_values: Optional[Sequence[float]] = None) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """Load materials and sync to the primary frequency grid.
     
     Args:
         parsed_layers: List of layer dictionaries
         all_freq: If True, use full frequency grid; otherwise use sparse_53
         freq_skip: Skip factor for frequency grid (1=all points, 2=half points, etc.)
+        freq_offset: Starting offset for skip-based subsets
+        freq_indices: Explicit indices into the selected base frequency table
+        freq_values: Explicit angular frequencies in rad/s. Values must exist
+            exactly in every material table used by the input stack.
     """
     # Resolve materials directory relative to this file
     _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -51,11 +58,18 @@ def load_materials_and_grid(parsed_layers: List[Dict], all_freq: bool, freq_skip
         raise ValueError(f"Primary material file not found: {primary_file}")
     
     primary_data = np.loadtxt(primary_file)
-    omega_grid = primary_data[:, 0]
+    base_omega_grid = primary_data[:, 0]
     
-    # Apply frequency skip to reduce grid density
-    if freq_skip > 1:
-        omega_grid = omega_grid[::freq_skip]
+    if freq_values is not None:
+        omega_grid = np.array(freq_values, dtype=float)
+    elif freq_indices is not None:
+        omega_grid = base_omega_grid[np.array(freq_indices, dtype=int)]
+    else:
+        if freq_skip < 1:
+            raise ValueError("freq_skip must be >= 1")
+        if freq_offset < 0 or freq_offset >= freq_skip:
+            raise ValueError("freq_offset must satisfy 0 <= freq_offset < freq_skip")
+        omega_grid = base_omega_grid[freq_offset::freq_skip]
     
     material_eps = {}
     

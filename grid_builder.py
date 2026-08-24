@@ -2,7 +2,8 @@ import numpy as np
 from typing import Tuple
 from utils import c
 
-def build_k_grid(omega_min: float, gap_thickness: float = None) -> Tuple[np.ndarray, np.ndarray]:
+def build_k_grid(omega_min: float, gap_thickness: float = None,
+                 num_points: int = 1000) -> Tuple[np.ndarray, np.ndarray]:
     """Build continuous k_parallel grid with integration weights
     
     For near-field radiative heat transfer, the evanescent wave contribution
@@ -12,12 +13,14 @@ def build_k_grid(omega_min: float, gap_thickness: float = None) -> Tuple[np.ndar
     Args:
         omega_min: minimum angular frequency
         gap_thickness: vacuum gap thickness in meters (for scaling k_max)
+        num_points: number of logarithmically spaced integration points
     
     Returns:
         k_par_grid: array of k_parallel values
         k_weights: integration weights for each k_parallel
     """
-    num_points = 1000  # Increased from 500 for better resolution
+    if num_points < 2:
+        raise ValueError("num_points must be >= 2")
     
     # k_max should be at least 10/gap to capture near-field contribution
     # For smallest gaps (~10 nm), need k_max ~ 1e9 or higher

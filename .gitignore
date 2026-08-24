@@ -29,6 +29,15 @@ desktop.ini
 results/
 results_test/
 output/
+batch_*/
+combined_*/
+diagnostics/
+bymetadata_*/
+delta*_*/
+heff_*/
+hw*_*/
+request_*/
+test_*/
 
 # Logs
 *.log

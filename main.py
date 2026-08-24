@@ -1,187 +1,139 @@
 import os
+import json
 import time
 import numpy as np
 import pandas as pd
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List
 import logging
 
 from config_parser import parse_stack_file
 from materials import load_materials_and_grid
 from grid_builder import build_k_grid
-from scattering import compute_kz, fresnel_reflection_s, fresnel_transmission_s
-from scattering import fresnel_reflection_p, fresnel_transmission_p
-from scattering import redheffer_star, compute_bloch_reflection
-from scattering import compute_interface_s_matrix, compute_propagation_s_matrix
-from scattering import compute_bloch_reflection_backward
-from fed_engine import compute_transmission, compute_observables
+from scattering import compute_kz
+from fed_engine import classify_prop_evan_modes, compute_observables, compute_transmission
+import tau_grid
 from utils import c, setup_logger
 from post_processing import run_post_processing
 
 logger = logging.getLogger("fed_solver")
 
-def compute_unit_cell_s_matrix(layers: List[dict], omega: float, k_par: float, pol: str, 
-                                material_eps: dict, freq_idx: int) -> Tuple[complex, complex, complex, complex]:
-    """Compute the S-matrix for a sequence of layers.
-    
-    For a periodic structure, we compute:
-    1. Propagation through each layer
-    2. Interface S-matrix between consecutive layers
-    3. Boundary interface (from last material to first material for periodic)
-    
-    Args:
-        layers: list of layer dictionaries
-        omega: angular frequency
-        k_par: parallel wavevector
-        pol: polarization ('s' or 'p')
-        material_eps: dictionary of material permittivities
-        freq_idx: frequency index for material permittivity array
-    
-    Returns:
-        S_UC: unit cell S-matrix (R11, T12, T21, R22)
-    """
-    if len(layers) == 0:
-        return (0.0, 1.0, 1.0, 0.0)
-    
-    def get_eps(layer):
-        eps_array = material_eps[layer['material']]
-        if isinstance(eps_array, np.ndarray):
-            return eps_array[freq_idx]
-        return eps_array
-    
-    def get_kz(eps):
-        return compute_kz(eps, omega, k_par, c)
-    
-    def get_interface_s(eps_i, eps_j, kz_i, kz_j):
-        if pol == 's':
-            r_ij = fresnel_reflection_s(kz_i, kz_j)
-            t_ij = fresnel_transmission_s(kz_i, kz_j)
-            r_ji = fresnel_reflection_s(kz_j, kz_i)
-            t_ji = fresnel_transmission_s(kz_j, kz_i)
-        else:
-            r_ij = fresnel_reflection_p(eps_i, eps_j, kz_i, kz_j)
-            t_ij = fresnel_transmission_p(eps_i, eps_j, kz_i, kz_j)
-            r_ji = fresnel_reflection_p(eps_j, eps_i, kz_j, kz_i)
-            t_ji = fresnel_transmission_p(eps_j, eps_i, kz_j, kz_i)
-        return (r_ij, t_ij, t_ji, r_ji)
-    
-    eps_list = [get_eps(layer) for layer in layers]
-    kz_list = [get_kz(eps) for eps in eps_list]
-    
-    S_total = None
-    
-    for i, layer in enumerate(layers):
-        kz = kz_list[i]
-        S_prop = compute_propagation_s_matrix(kz, layer['thickness'])
-        
-        if S_total is None:
-            S_total = S_prop
-        else:
-            S_total = redheffer_star(S_total, S_prop)
-        
-        if i < len(layers) - 1:
-            S_interface = get_interface_s(eps_list[i], eps_list[i+1], kz_list[i], kz_list[i+1])
-            S_total = redheffer_star(S_total, S_interface)
-    
-    if len(layers) > 1:
-        first_eps = eps_list[0]
-        last_eps = eps_list[-1]
-        first_kz = kz_list[0]
-        last_kz = kz_list[-1]
-        
-        S_boundary = get_interface_s(last_eps, first_eps, last_kz, first_kz)
-        S_total = redheffer_star(S_total, S_boundary)
-    
-    if S_total is None:
-        return (0.0, 1.0, 1.0, 0.0)
-    
-    return S_total
+POLARIZATIONS = ('s', 'p')
+OMEGA_COLUMN = 'omega (rad/s)'
 
-def compute_bloch_reflection_forward(S_UC: Tuple[complex, complex, complex, complex],
-                                      kz_gap: complex = None,
-                                      debug: bool = False) -> complex:
-    """Compute forward Bloch reflection: R_R = R11 + T12 * R_R * (1 - R22 * R_R)^(-1) * T21
-    
-    This is the standard Bloch reflection for light incident from the left.
-    Solves the quadratic: R22 * R^2 + (T12*T21 - R11*R22 - 1) * R + R11 = 0
-    """
-    return compute_bloch_reflection(S_UC, kz_gap=kz_gap, debug=debug)
+def make_single_polarization_tau_array(pol: str, tau_values: np.ndarray) -> np.ndarray:
+    """Return a two-row tau array with only one polarization populated."""
+    tau_array = np.zeros((2, len(tau_values)))
+    pol_index = POLARIZATIONS.index(pol)
+    tau_array[pol_index] = tau_values
+    return tau_array
 
-def compute_bloch_reflection_backward_local(S_UC: Tuple[complex, complex, complex, complex],
-                                             kz_gap: complex = None,
-                                             debug: bool = False) -> complex:
-    """Compute backward Bloch reflection: R_L = R22 + T21 * R_L * (1 - R11 * R_L)^(-1) * T12
-    
-    This is the Bloch reflection for light incident from the right.
-    Solves the quadratic: R11 * R^2 + (T12*T21 - R11*R22 - 1) * R + R22 = 0
-    """
-    return compute_bloch_reflection_backward(S_UC, kz_gap=kz_gap, debug=debug)
+def parse_metadata_items(items: Optional[List[str]]) -> Dict[str, str]:
+    """Parse CLI metadata entries without giving them solver semantics."""
+    metadata = {}
+    for item in items or []:
+        if '=' not in item:
+            raise ValueError(f"Invalid metadata item '{item}'. Expected KEY=VALUE.")
+        key, value = item.split('=', 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"Invalid metadata item '{item}'. Metadata key is empty.")
+        metadata[key] = value.strip()
+    return metadata
 
-def compute_R_L_and_R_R_circular_shift(all_layers: List[dict], probe_idx: int, 
-                                        omega: float, k_par: float, pol: str,
-                                        material_eps: dict, freq_idx: int,
-                                        kz_gap: complex = None,
-                                        debug: bool = False) -> Tuple[complex, complex]:
-    """Compute R_L and R_R using Circular Shift Algorithm.
-    
-    For a probe at index p in a unit cell of length N:
-    - R_R: shifted sequence = Layer(p+1) to Layer(N-1), then Layer(0) to Layer(p)
-    - R_L: shifted sequence = Layer(p) to Layer(N-1), then Layer(0) to Layer(p-1)
-    
-    Args:
-        all_layers: list of all layer dictionaries in the unit cell
-        probe_idx: index of the probe layer
-        omega: angular frequency
-        k_par: parallel wavevector
-        pol: polarization ('s' or 'p')
-        material_eps: dictionary of material permittivities
-        freq_idx: frequency index
-        kz_gap: z-component of wavevector in the gap (for root selection)
-        debug: if True, print debug information
-    
-    Returns:
-        (R_L, R_R): tuple of complex reflection coefficients
-    """
-    N = len(all_layers)
-    
-    if debug:
-        logger.info(f"  Circular Shift Algorithm: probe_idx={probe_idx}, N={N}")
-        logger.info(f"  All layers: {[(l['layer_id'], l['material']) for l in all_layers]}")
-    
-    right_sequence = []
-    for i in range(probe_idx + 1, N):
-        right_sequence.append(all_layers[i])
-    for i in range(0, probe_idx + 1):
-        right_sequence.append(all_layers[i])
-    
-    if debug:
-        logger.info(f"  Right sequence (for R_R): {[(l['layer_id'], l['material']) for l in right_sequence]}")
-    
-    S_right = compute_unit_cell_s_matrix(right_sequence, omega, k_par, pol, material_eps, freq_idx)
-    R_R = compute_bloch_reflection_forward(S_right, kz_gap=kz_gap, debug=debug)
-    
-    if debug:
-        R11, T12, T21, R22 = S_right
-        logger.info(f"  S_right: R11={R11:.6e}, T12={T12:.6e}, T21={T21:.6e}, R22={R22:.6e}")
-        logger.info(f"  R_R (forward Bloch) = {R_R:.6e}, Im(R_R)={np.imag(R_R):.6e}")
-    
-    left_sequence = []
-    for i in range(probe_idx, N):
-        left_sequence.append(all_layers[i])
-    for i in range(0, probe_idx):
-        left_sequence.append(all_layers[i])
-    
-    if debug:
-        logger.info(f"  Left sequence (for R_L): {[(l['layer_id'], l['material']) for l in left_sequence]}")
-    
-    S_left = compute_unit_cell_s_matrix(left_sequence, omega, k_par, pol, material_eps, freq_idx)
-    R_L = compute_bloch_reflection_backward_local(S_left, kz_gap=kz_gap, debug=debug)
-    
-    if debug:
-        R11, T12, T21, R22 = S_left
-        logger.info(f"  S_left: R11={R11:.6e}, T12={T12:.6e}, T21={T21:.6e}, R22={R22:.6e}")
-        logger.info(f"  R_L (backward Bloch) = {R_L:.6e}, Im(R_L)={np.imag(R_L):.6e}")
-    
-    return R_L, R_R
+def parse_int_items(value: Optional[str]) -> Optional[List[int]]:
+    """Parse comma-separated integers or a file containing integers."""
+    if not value:
+        return None
+    if os.path.exists(value):
+        with open(value, 'r', encoding='utf-8') as f:
+            text = f.read()
+    else:
+        text = value
+    items = []
+    for token in text.replace('\n', ',').split(','):
+        token = token.strip()
+        if token:
+            items.append(int(token))
+    return items
+
+def parse_float_file(path: Optional[str]) -> Optional[List[float]]:
+    """Parse one angular frequency per line, or comma-separated values."""
+    if not path:
+        return None
+    with open(path, 'r', encoding='utf-8') as f:
+        text = f.read()
+    values = []
+    for token in text.replace('\n', ',').split(','):
+        token = token.strip()
+        if token:
+            values.append(float(token))
+    return values
+
+def omega_key(omega: float) -> str:
+    return f"{float(omega):.15e}"
+
+def read_existing_omega_keys(path: str) -> set:
+    if not os.path.exists(path):
+        return set()
+    df = pd.read_csv(path, usecols=[OMEGA_COLUMN])
+    return {omega_key(value) for value in df[OMEGA_COLUMN].values}
+
+def merge_result_csv(path: str, new_df: pd.DataFrame) -> pd.DataFrame:
+    """Merge new omega rows with an existing result file, keeping sorted uniques."""
+    frames = []
+    if os.path.exists(path):
+        frames.append(pd.read_csv(path))
+    if not new_df.empty:
+        frames.append(new_df)
+    if frames:
+        merged = pd.concat(frames, ignore_index=True)
+        merged = merged.drop_duplicates(subset=[OMEGA_COLUMN], keep='last')
+        merged = merged.sort_values(OMEGA_COLUMN).reset_index(drop=True)
+    else:
+        merged = new_df
+    merged.to_csv(path, index=False, float_format='%.15e')
+    return merged
+
+def write_run_metadata(out_dir: str, input_path: str, args: dict, parsed_layers: List[dict],
+                       group_defs: List[dict], omega_grid: np.ndarray,
+                       k_par_grid: np.ndarray, gap_thickness: Optional[float]) -> None:
+    """Write solver metadata while keeping external geometry as passive tags."""
+    metadata = {
+        'input_path': input_path,
+        'solver_scope': 'local_1d_periodic_stack_fed',
+        'external_geometry_metadata': args.get('metadata', {}),
+        'temperature_K': args.get('temperature'),
+        'all_freq': args.get('all_freq', False),
+        'freq_skip': args.get('freq_skip', 1),
+        'freq_offset': args.get('freq_offset', 0),
+        'freq_indices': args.get('freq_indices'),
+        'freq_values_file': args.get('freq_values_file'),
+        'resume': args.get('resume', False),
+        'requested_k_parallel_points': args.get('k_grid_points', 1000),
+        'vacuum_gap_m': gap_thickness,
+        'omega_points': int(len(omega_grid)),
+        'omega_min_rad_s': float(omega_grid[0]),
+        'omega_max_rad_s': float(omega_grid[-1]),
+        'k_parallel_points': int(len(k_par_grid)),
+        'k_parallel_min_1_m': float(k_par_grid[0]),
+        'k_parallel_max_1_m': float(k_par_grid[-1]),
+        'layers': parsed_layers,
+        'groups': group_defs,
+        'notes': [
+            'pss4_project computes the local sidewall FED coefficient h_W.',
+            'Device-scale geometry metadata is recorded here but not interpreted by the solver.',
+        ],
+    }
+    path = os.path.join(out_dir, 'run_metadata.json')
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, indent=2)
+
+# Keep these names available from main.py for older callers, but delegate the
+# implementation to the reusable tau_grid module.
+compute_unit_cell_s_matrix = tau_grid.compute_unit_cell_s_matrix
+compute_bloch_reflection_forward = tau_grid.compute_bloch_reflection_forward
+compute_bloch_reflection_backward_local = tau_grid.compute_bloch_reflection_backward_local
+compute_R_L_and_R_R_circular_shift = tau_grid.compute_R_L_and_R_R_circular_shift
 
 def run_solver(input_path: str, args: dict):
     """Run the FED solver for all probe layers using unit cell invariance.
@@ -195,6 +147,11 @@ def run_solver(input_path: str, args: dict):
     temperature = args.get('temperature')
     all_freq = args.get('all_freq', False)
     freq_skip = args.get('freq_skip', 1)
+    freq_offset = args.get('freq_offset', 0)
+    freq_indices = args.get('freq_indices')
+    freq_values_file = args.get('freq_values_file')
+    freq_values = parse_float_file(freq_values_file)
+    resume = args.get('resume', False)
     out_dir = args.get('out_dir', 'results/')
     
     os.makedirs(out_dir, exist_ok=True)
@@ -211,8 +168,17 @@ def run_solver(input_path: str, args: dict):
         logger.info("No group definitions found in input file")
     
     logger.info("Loading materials and frequency grid")
-    omega_grid, material_eps = load_materials_and_grid(parsed_layers, all_freq, freq_skip=freq_skip)
+    omega_grid, material_eps = load_materials_and_grid(
+        parsed_layers,
+        all_freq,
+        freq_skip=freq_skip,
+        freq_offset=freq_offset,
+        freq_indices=freq_indices,
+        freq_values=freq_values,
+    )
     logger.info(f"Frequency grid: {len(omega_grid)} points, range [{omega_grid[0]:.3e}, {omega_grid[-1]:.3e}] rad/s")
+    if resume:
+        logger.info("Resume mode enabled: existing omega rows in output CSVs will be skipped and merged")
     
     source_indices = []
     for i, layer in enumerate(parsed_layers):
@@ -232,19 +198,24 @@ def run_solver(input_path: str, args: dict):
     if has_groups:
         logger.info("Group mode enabled: will compute per-source-layer contributions for grouping")
     
-    # Extract gap thickness from probe layer (Vacuum layer)
+    # parse_stack_file already converts input thicknesses from micrometres to metres.
+    # Keep this value in SI units; multiplying by 1e-6 again would corrupt the
+    # near-field k-grid scaling by six orders of magnitude.
     gap_thickness = None
     for layer in parsed_layers:
         if layer['material'] == 'Vacuum':
-            gap_thickness = layer['thickness'] * 1e-6  # Convert um to m
+            gap_thickness = layer['thickness']
             logger.info(f"Detected vacuum gap thickness: {gap_thickness:.3e} m")
             break
     
     logger.info("Building k_parallel grid")
-    k_par_grid, k_weights = build_k_grid(omega_grid[0], gap_thickness)
+    k_grid_points = args.get('k_grid_points', 1000)
+    k_par_grid, k_weights = build_k_grid(
+        omega_grid[0], gap_thickness, num_points=k_grid_points)
     logger.info(f"k_parallel grid: {len(k_par_grid)} points, range [{k_par_grid[0]:.3e}, {k_par_grid[-1]:.3e}] 1/m")
     if gap_thickness:
         logger.info(f"k_max * gap = {k_par_grid[-1] * gap_thickness:.1f} (should be >> 1 for near-field)")
+    write_run_metadata(out_dir, input_path, args, parsed_layers, group_defs, omega_grid, k_par_grid, gap_thickness)
     
     for probe_idx in probe_indices:
         probe_layer = parsed_layers[probe_idx]
@@ -258,18 +229,24 @@ def run_solver(input_path: str, args: dict):
             src_layer = parsed_layers[src_idx]
             src_task_id = f"{probe_task_id}_S{src_layer['layer_id']}"
             per_source_results[src_task_id] = {
-                'omega (rad/s)': omega_grid,
+                OMEGA_COLUMN: [],
                 'transmission': [],
                 'src_layer_idx': src_idx
             }
             if temperature is not None:
                 per_source_results[src_task_id]['spectral_flux (W/m2/K/(rad/s))'] = []
         
-        total_results = {'omega (rad/s)': omega_grid, 'transmission': []}
+        output_file_total = os.path.join(out_dir, f"{probe_task_id}.csv")
+        existing_omega_keys = read_existing_omega_keys(output_file_total) if resume else set()
+        if resume and existing_omega_keys:
+            logger.info(f"{probe_task_id}: found {len(existing_omega_keys)} existing omega rows")
+        total_results = {OMEGA_COLUMN: [], 'transmission': []}
         if temperature is not None:
             total_results['spectral_flux (W/m2/K/(rad/s))'] = []
         
         for i, omega in enumerate(omega_grid):
+            if resume and omega_key(omega) in existing_omega_keys:
+                continue
             tau_per_src = {}
             for src_idx in source_indices:
                 tau_per_src[src_idx] = 0.0
@@ -282,7 +259,7 @@ def run_solver(input_path: str, args: dict):
             if i == 0:
                 logger.info(f"First frequency omega[0] = {omega:.6e} rad/s")
             
-            for pol_idx, pol in enumerate(['s', 'p']):
+            for pol_idx, pol in enumerate(POLARIZATIONS):
                 tau_array_total = np.zeros(len(k_par_grid))
                 tau_arrays_per_src = {src_idx: np.zeros(len(k_par_grid)) for src_idx in source_indices}
                 
@@ -295,12 +272,12 @@ def run_solver(input_path: str, args: dict):
                             eps_v = eps_vac[i]
                         else:
                             eps_v = eps_vac
-                        k0 = omega / c
-                        k_critical = k0 * np.sqrt(eps_v)
-                        logger.info(f"Critical k_par (k0*sqrt(eps_vac)) = {k_critical:.6e} 1/m")
+                        propagating_mask, evanescent_mask, k_boundary = classify_prop_evan_modes(
+                            k_par_grid, omega, eps_v)
+                        logger.info(f"Critical k_par (k0*sqrt(eps_vac)) = {k_boundary:.6e} 1/m")
                         logger.info(f"k_par grid range: [{k_par_grid[0]:.6e}, {k_par_grid[-1]:.6e}] 1/m")
-                        n_propagating = np.sum(k_par_grid < np.real(k_critical))
-                        n_evanescent = np.sum(k_par_grid >= np.real(k_critical))
+                        n_propagating = np.sum(propagating_mask)
+                        n_evanescent = np.sum(evanescent_mask)
                         logger.info(f"Propagating modes: {n_propagating}, Evanescent modes: {n_evanescent}")
                 
                 for k_idx, k_par in enumerate(k_par_grid):
@@ -331,7 +308,7 @@ def run_solver(input_path: str, args: dict):
                         logger.info(f"  Im(kz_probe) = {np.imag(kz_probe):.6e}, d_gap = {d_gap:.6e} m")
                         logger.info(f"  exp(-2*Im(kz)*d) = {np.exp(-2 * np.imag(kz_probe) * d_gap):.6e}")
                     
-                    R_L, R_R = compute_R_L_and_R_R_circular_shift(
+                    R_L, R_R = tau_grid.compute_R_L_and_R_R_circular_shift(
                         parsed_layers, probe_idx, omega, k_par, pol, material_eps, i,
                         kz_gap=kz_probe, debug=debug_this)
                     
@@ -357,11 +334,8 @@ def run_solver(input_path: str, args: dict):
                             eps_v = eps_vac[i]
                         else:
                             eps_v = eps_vac
-                        k0 = omega / c
-                        k_critical = k0 * np.sqrt(eps_v)
-                        
-                        propagating_mask = k_par_grid < np.real(k_critical)
-                        evanescent_mask = k_par_grid >= np.real(k_critical)
+                        propagating_mask, evanescent_mask, _ = classify_prop_evan_modes(
+                            k_par_grid, omega, eps_v)
                         
                         if np.any(propagating_mask):
                             tau_prop = tau_array_total[propagating_mask]
@@ -370,9 +344,13 @@ def run_solver(input_path: str, args: dict):
                             tau_evan = tau_array_total[evanescent_mask]
                             logger.info(f"Evanescent tau: min={np.min(tau_evan):.6e}, max={np.max(tau_evan):.6e}, mean={np.mean(tau_evan):.6e}")
                 
-                obs_total = compute_observables(omega, temperature, 
-                                         np.array([tau_array_total, tau_array_total]),
-                                         k_par_grid, k_weights)
+                obs_total = compute_observables(
+                    omega,
+                    temperature,
+                    make_single_polarization_tau_array(pol, tau_array_total),
+                    k_par_grid,
+                    k_weights,
+                )
                 if i == 0:
                     logger.info(f"Observable transmission for pol {pol}: {obs_total['transmission']:.6e}")
                 
@@ -382,9 +360,13 @@ def run_solver(input_path: str, args: dict):
                 
                 if has_groups:
                     for src_idx in source_indices:
-                        obs_src = compute_observables(omega, temperature,
-                                               np.array([tau_arrays_per_src[src_idx], tau_arrays_per_src[src_idx]]),
-                                               k_par_grid, k_weights)
+                        obs_src = compute_observables(
+                            omega,
+                            temperature,
+                            make_single_polarization_tau_array(pol, tau_arrays_per_src[src_idx]),
+                            k_par_grid,
+                            k_weights,
+                        )
                         tau_per_src[src_idx] += obs_src['transmission']
                         if temperature is not None:
                             spectral_flux_per_src[src_idx] += obs_src.get('spectral_flux', 0.0)
@@ -392,6 +374,7 @@ def run_solver(input_path: str, args: dict):
             if i == 0:
                 logger.info(f"Total tau_total for omega[0]: {tau_total:.6e}")
             
+            total_results[OMEGA_COLUMN].append(omega)
             total_results['transmission'].append(tau_total)
             if temperature is not None:
                 total_results['spectral_flux (W/m2/K/(rad/s))'].append(spectral_flux_total)
@@ -400,20 +383,21 @@ def run_solver(input_path: str, args: dict):
                 for src_idx in source_indices:
                     src_layer = parsed_layers[src_idx]
                     src_task_id = f"{probe_task_id}_S{src_layer['layer_id']}"
+                    per_source_results[src_task_id][OMEGA_COLUMN].append(omega)
                     per_source_results[src_task_id]['transmission'].append(tau_per_src[src_idx])
                     if temperature is not None:
                         per_source_results[src_task_id]['spectral_flux (W/m2/K/(rad/s))'].append(spectral_flux_per_src[src_idx])
         
         df_total = pd.DataFrame(total_results)
-        output_file_total = os.path.join(out_dir, f"{probe_task_id}.csv")
-        df_total.to_csv(output_file_total, index=False, float_format='%.15e')
-        logger.info(f"Saved total results to {output_file_total}")
+        merged_total = merge_result_csv(output_file_total, df_total)
+        logger.info(f"Saved total results to {output_file_total} ({len(df_total)} new, {len(merged_total)} total rows)")
         
         if has_groups:
             for src_task_id, src_data in per_source_results.items():
                 df_src = pd.DataFrame({k: v for k, v in src_data.items() if k != 'src_layer_idx'})
                 output_file_src = os.path.join(out_dir, f"{src_task_id}.csv")
-                df_src.to_csv(output_file_src, index=False, float_format='%.15e')
+                merged_src = merge_result_csv(output_file_src, df_src)
+                logger.info(f"Saved source results to {output_file_src} ({len(df_src)} new, {len(merged_src)} total rows)")
             logger.info(f"Saved {len(per_source_results)} per-source-layer result files for probe {probe_task_id}")
     
     end_time = time.time()
@@ -437,7 +421,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="1D-Periodic Planar FED Solver")
     parser.add_argument("--temperature", type=float, default=None, help="Source temperature in Kelvin")
     parser.add_argument("--all-freq", action="store_true", default=False, help="Use full frequency grid")
+    parser.add_argument("--freq-skip", type=int, default=1,
+                        help="Use every Nth frequency from the selected material table")
+    parser.add_argument("--freq-offset", type=int, default=0,
+                        help="Starting offset for --freq-skip subsets; must satisfy 0 <= offset < skip")
+    parser.add_argument("--freq-indices", type=str, default=None,
+                        help="Comma-separated indices or a text file of indices into the selected material table")
+    parser.add_argument("--freq-values-file", type=str, default=None,
+                        help="Text file of explicit omega values in rad/s; each value must exist in the material tables")
+    parser.add_argument("--resume", action="store_true", default=False,
+                        help="Skip omega rows already present in output CSVs, then merge sorted unique outputs")
+    parser.add_argument("--k-grid-points", type=int, default=1000,
+                        help="Number of logarithmically spaced k_parallel integration points (default: 1000)")
     parser.add_argument("--out-dir", type=str, default="results/", help="Output directory")
+    parser.add_argument("--meta", action="append", default=[], metavar="KEY=VALUE",
+                        help="Passive run metadata tag; recorded in run_metadata.json but not used by the solver")
     parser.add_argument("input_path", type=str, help="Path to input stack file")
     
     args = parser.parse_args()
@@ -445,7 +443,14 @@ if __name__ == "__main__":
     args_dict = {
         'temperature': args.temperature,
         'all_freq': args.all_freq,
-        'out_dir': args.out_dir
+        'freq_skip': args.freq_skip,
+        'freq_offset': args.freq_offset,
+        'freq_indices': parse_int_items(args.freq_indices),
+        'freq_values_file': args.freq_values_file,
+        'resume': args.resume,
+        'k_grid_points': args.k_grid_points,
+        'out_dir': args.out_dir,
+        'metadata': parse_metadata_items(args.meta),
     }
     
     run_solver(args.input_path, args_dict)
