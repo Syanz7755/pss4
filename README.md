@@ -130,6 +130,12 @@ python scripts/visualize_tau_heatmaps.py examples/example_2layer.txt --polarizat
 Use `--no-prop-evan-boundary` to omit the curve. Boundary style can be adjusted
 with `--boundary-color`, `--boundary-linestyle`, and `--boundary-linewidth`.
 
+To post-process saved `tau_s` and `tau_p` grids into propagating and evanescent
+transmission/spectral-flux contributions, see
+[`docs/tau_prop_evan_postprocessing.md`](docs/tau_prop_evan_postprocessing.md).
+The same guide documents the separate Bloch-mode classification for the exact
+periodic input stack.
+
 ### Programmatic usage
 
 ```python
